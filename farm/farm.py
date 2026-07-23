@@ -282,16 +282,22 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
 
 
 def read_accounts(path):
+    base = Path(path).resolve().parent  # device paths are relative to accounts.csv
     accounts = []
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             if not row.get("email", "").strip() or row["email"].lstrip().startswith("#"):
                 continue
+            dpp = (row.get("device_properties_path") or "").strip()
+            if dpp and not Path(dpp).is_absolute():
+                dpp = str(base / dpp)
+            if dpp and not Path(dpp).is_file():
+                sys.exit(f"device_properties_path not found for {row['email']}: {dpp}")
             accounts.append({
                 "email": row["email"].strip(),
                 "token": row["token"].strip(),
                 "token_type": (row.get("token_type") or "aas").strip().lower(),
-                "device_properties_path": (row.get("device_properties_path") or "").strip(),
+                "device_properties_path": dpp,
                 "locale": (row.get("locale") or "").strip(),
                 "fails": 0,
             })

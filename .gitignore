@@ -7,5 +7,4 @@ farm/accounts.csv
 farm/queue.db
 farm/logs/
 farm/out/
-farm/devices/
 farm/__pycache__/
