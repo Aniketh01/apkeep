@@ -16,16 +16,18 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+import requests
 
 # ---- pure queue logic (unit-tested in test_farm.py) -------------------------
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS apps (
     pkg TEXT PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'pending',  -- pending | claimed | done | failed
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | claimed | done | failed | not_found
     attempts INTEGER NOT NULL DEFAULT 0,
     account TEXT,
-    updated REAL NOT NULL DEFAULT 0
+    updated REAL NOT NULL DEFAULT 0,
+    provider TEXT NOT NULL DEFAULT 'google_play'
 );
 CREATE TABLE IF NOT EXISTS accounts (
     email TEXT PRIMARY KEY,
@@ -85,13 +87,22 @@ def claim_batch(conn, account, n, now):
     return pkgs
 
 
-def record_results(conn, successes, failures, max_attempts, now):
-    """Mark successes done; bump failures back to pending (or 'failed' at max_attempts)."""
+def record_results(conn, successes, failures, max_attempts, now, not_found=None):
+    """Mark successes done; bump failures back to pending (or 'failed'/'not_found' at max_attempts)."""
+    if not_found is None:
+        not_found = []
+
     if successes:
         qs = ",".join("?" * len(successes))
         conn.execute(
             f"UPDATE apps SET status='done', updated=? WHERE pkg IN ({qs})",
             [now, *successes],
+        )
+    if not_found:
+        qs = ",".join("?" * len(not_found))
+        conn.execute(
+            f"UPDATE apps SET attempts=attempts+1, status='not_found', updated=?, account=NULL WHERE pkg IN ({qs})",
+            [now, *not_found],
         )
     for pkg in failures:
         conn.execute(
@@ -247,8 +258,32 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
 
         successes = [p for p in batch if produced(cfg.outdir, p)]
         failures = [p for p in batch if p not in successes]
+
+        not_found = []
+        final_failures = []
+        if failures:
+            with lock:
+                qs = ",".join("?" * len(failures))
+                attempts_map = dict(conn.execute(f"SELECT pkg, attempts FROM apps WHERE pkg IN ({qs})", failures).fetchall())
+            
+            for pkg in failures:
+                if attempts_map.get(pkg, 0) + 1 >= cfg.max_attempts:
+                    print(f"[{name}] {pkg} reached max_attempts, checking if it exists on Play Store...")
+                    exists = check_package_exists(pkg)
+                    if exists is False:
+                        print(f"[{name}] {pkg} not found on Play Store.")
+                        not_found.append(pkg)
+                    else:
+                        if exists is None:
+                            print(f"[{name}] Network error checking {pkg}, moving to failed state.")
+                        else:
+                            print(f"[{name}] {pkg} exists but failed to download.")
+                        final_failures.append(pkg)
+                else:
+                    final_failures.append(pkg)
+
         with lock:
-            record_results(conn, successes, failures, cfg.max_attempts, time.time())
+            record_results(conn, successes, final_failures, cfg.max_attempts, time.time(), not_found=not_found)
 
         # account health: rc!=0 (login death) or a batch that produced nothing = a strike
         if rc != 0 or (batch and not successes):
@@ -318,6 +353,17 @@ def read_pkgs(path, field):
                     pkgs.append(pkg)
     return pkgs
 
+def check_package_exists(package_name: str):
+    url = f"https://play.google.com/store/apps/details?id={package_name}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    try:
+        response = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
+        return response.status_code != 404
+    except requests.RequestException as e:
+        print(f"Network error checking {package_name}: {e}")
+        return None
+    
 
 def main(argv=None):
     import sqlite3
