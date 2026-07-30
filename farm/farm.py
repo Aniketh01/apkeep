@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS apps (
     attempts INTEGER NOT NULL DEFAULT 0,
     account TEXT,
     updated REAL NOT NULL DEFAULT 0,
-    provider TEXT NOT NULL DEFAULT 'google_play'
+    provider TEXT NOT NULL DEFAULT 'google_play',
+    path TEXT
 );
 CREATE TABLE IF NOT EXISTS accounts (
     email TEXT PRIMARY KEY,
@@ -87,16 +88,18 @@ def claim_batch(conn, account, n, now):
     return pkgs
 
 
-def record_results(conn, successes, failures, max_attempts, now, not_found=None):
+def record_results(conn, successes, failures, max_attempts, now, not_found=None, success_paths=None):
     """Mark successes done; bump failures back to pending (or 'failed'/'not_found' at max_attempts)."""
     if not_found is None:
         not_found = []
+    if success_paths is None:
+        success_paths = {}
 
     if successes:
-        qs = ",".join("?" * len(successes))
-        conn.execute(
-            f"UPDATE apps SET status='done', updated=? WHERE pkg IN ({qs})",
-            [now, *successes],
+        data = [(now, success_paths.get(p), p) for p in successes]
+        conn.executemany(
+            "UPDATE apps SET status='done', updated=?, path=? WHERE pkg=?",
+            data,
         )
     if not_found:
         qs = ",".join("?" * len(not_found))
@@ -256,7 +259,33 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
         finally:
             os.unlink(batch_csv)
 
-        successes = [p for p in batch if produced(cfg.outdir, p)]
+        successes = []
+        success_paths = {}
+        for p in batch:
+            if produced(cfg.outdir, p):
+                info = cfg.apk_info.get(p) if hasattr(cfg, "apk_info") else None
+                new_dir = Path(cfg.outdir) / p
+                if info:
+                    version_code = info.get("versionCode")
+                    if version_code is not None:
+                        old_apk = Path(cfg.outdir) / f"{p}.apk"
+                        old_dir = Path(cfg.outdir) / p
+                        new_dir = Path(cfg.outdir) / f"{p}_{version_code}"
+                        
+                        if old_dir.is_dir():
+                            try:
+                                old_dir.rename(new_dir)
+                            except OSError:
+                                pass
+                        elif old_apk.is_file():
+                            new_dir.mkdir(parents=True, exist_ok=True)
+                            try:
+                                old_apk.rename(new_dir / f"{p}.apk")
+                            except OSError:
+                                pass
+                successes.append(p)
+                success_paths[p] = str(new_dir)
+
         failures = [p for p in batch if p not in successes]
 
         not_found = []
@@ -279,13 +308,18 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
                     else:
                         print(f"[{name}] {pkg} exists but failed to download.")
                         
-                    sha256 = cfg.apk_info.get(pkg) if hasattr(cfg, "apk_info") else None
+                    info = cfg.apk_info.get(pkg) if hasattr(cfg, "apk_info") else None
+                    sha256 = info.get("sha256") if info else None
+                    version_code = info.get("versionCode") if info else None
+                    
                     if cfg.androzoo_api_key and sha256:
                         print(f"[{name}] Attempting to download {pkg} from AndroZoo...")
-                        if download_package_from_Androzoo(pkg, sha256, cfg.outdir, cfg.androzoo_api_key):
+                        if download_package_from_Androzoo(pkg, sha256, cfg.outdir, cfg.androzoo_api_key, version_code):
                             print(f"[{name}] Successfully downloaded {pkg} from AndroZoo.")
                             androzoo_successes.append(pkg)
                             successes.append(pkg)
+                            dir_name = f"{pkg}_{version_code}" if version_code is not None else pkg
+                            success_paths[pkg] = str(Path(cfg.outdir) / dir_name)
                         else:
                             if exists is False:
                                 not_found.append(pkg)
@@ -304,7 +338,7 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
             if androzoo_successes:
                 qs = ",".join("?" * len(androzoo_successes))
                 conn.execute(f"UPDATE apps SET provider='androzoo' WHERE pkg IN ({qs})", androzoo_successes)
-            record_results(conn, successes, final_failures, cfg.max_attempts, time.time(), not_found=not_found)
+            record_results(conn, successes, final_failures, cfg.max_attempts, time.time(), not_found=not_found, success_paths=success_paths)
 
         # account health: rc!=0 (login death) or a batch that produced nothing = a strike
         if rc != 0 or (batch and not successes):
@@ -389,14 +423,15 @@ def check_package_exists(package_name: str):
         print(f"Network error checking {package_name}: {e}")
         return None
 
-def download_package_from_Androzoo(package_name, sha256, outdir, api_key):
+def download_package_from_Androzoo(package_name, sha256, outdir, api_key, version_code):
     if not api_key:
         return False
     if not sha256:
         print(f"[{package_name}] No SHA256 available, cannot download from AndroZoo.")
         return False
 
-    pkg_dir = Path(outdir) / package_name
+    dir_name = f"{package_name}_{version_code}" if version_code is not None else package_name
+    pkg_dir = Path(outdir) / dir_name
     pkg_dir.mkdir(parents=True, exist_ok=True)
     final_apk_path = pkg_dir / f"{package_name}.apk"
     
@@ -428,7 +463,7 @@ def load_apk_info(json_path):
         return {}
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    return {item["packageName"]: item.get("sha256") for item in data}
+    return {item["packageName"]: {"sha256": item.get("sha256"), "versionCode": item.get("versionCode")} for item in data}
 
 
 def main(argv=None):
