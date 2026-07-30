@@ -86,6 +86,14 @@ python3 farm.py \
 Stop any time with Ctrl-C (workers finish their current batch). Re-run the same
 command to resume — finished apps are skipped, interrupted ones are picked back up.
 
+### AndroZoo Fallback
+
+If an app fails to download from Google Play after the maximum number of attempts (or is unavailable/geo-blocked), the script can automatically fall back to downloading it from AndroZoo.
+
+To enable this feature:
+1. Export your API key: `export ANDROZOO_API_KEY="your_api_key"`
+2. Pass the `--json_parser_path metadata.json` flag (the JSON must map package names to their SHA256 hashes).
+
 ### Options
 
 | flag | default | meaning |
@@ -93,6 +101,7 @@ command to resume — finished apps are skipped, interrupted ones are picked bac
 | `--apps` | — | package list (CSV/text), one per line |
 | `--accounts` | — | accounts.csv |
 | `--outdir` | — | where APKs are written |
+| `--json_parser_path`| — | path to apk info json file (for AndroZoo fallback) |
 | `--apkeep` | `apkeep` | path to the apkeep binary |
 | `--field` | 1 | app-id column in `--apps` |
 | `--batch-size` | 50 | apps per account per apkeep call |

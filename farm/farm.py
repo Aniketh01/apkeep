@@ -261,6 +261,7 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
 
         not_found = []
         final_failures = []
+        androzoo_successes = []
         if failures:
             with lock:
                 qs = ",".join("?" * len(failures))
@@ -270,19 +271,39 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
                 if attempts_map.get(pkg, 0) + 1 >= cfg.max_attempts:
                     print(f"[{name}] {pkg} reached max_attempts, checking if it exists on Play Store...")
                     exists = check_package_exists(pkg)
+                    
                     if exists is False:
                         print(f"[{name}] {pkg} not found on Play Store.")
-                        not_found.append(pkg)
+                    elif exists is None:
+                        print(f"[{name}] Network error checking {pkg}.")
                     else:
-                        if exists is None:
-                            print(f"[{name}] Network error checking {pkg}, moving to failed state.")
+                        print(f"[{name}] {pkg} exists but failed to download.")
+                        
+                    sha256 = cfg.apk_info.get(pkg) if hasattr(cfg, "apk_info") else None
+                    if cfg.androzoo_api_key and sha256:
+                        print(f"[{name}] Attempting to download {pkg} from AndroZoo...")
+                        if download_package_from_Androzoo(pkg, sha256, cfg.outdir, cfg.androzoo_api_key):
+                            print(f"[{name}] Successfully downloaded {pkg} from AndroZoo.")
+                            androzoo_successes.append(pkg)
+                            successes.append(pkg)
                         else:
-                            print(f"[{name}] {pkg} exists but failed to download.")
-                        final_failures.append(pkg)
+                            if exists is False:
+                                not_found.append(pkg)
+                            else:
+                                final_failures.append(pkg)
+                    else:
+                        # Silently skip AndroZoo if no API key or no SHA256 mapping
+                        if exists is False:
+                            not_found.append(pkg)
+                        else:
+                            final_failures.append(pkg)
                 else:
                     final_failures.append(pkg)
 
         with lock:
+            if androzoo_successes:
+                qs = ",".join("?" * len(androzoo_successes))
+                conn.execute(f"UPDATE apps SET provider='androzoo' WHERE pkg IN ({qs})", androzoo_successes)
             record_results(conn, successes, final_failures, cfg.max_attempts, time.time(), not_found=not_found)
 
         # account health: rc!=0 (login death) or a batch that produced nothing = a strike
@@ -354,6 +375,10 @@ def read_pkgs(path, field):
     return pkgs
 
 def check_package_exists(package_name: str):
+    """
+    Checks if a package exists on the Play Store.
+    Returns True if it exists, False if it doesn't, None if there's a network error.
+    """
     url = f"https://play.google.com/store/apps/details?id={package_name}"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -363,7 +388,48 @@ def check_package_exists(package_name: str):
     except requests.RequestException as e:
         print(f"Network error checking {package_name}: {e}")
         return None
+
+def download_package_from_Androzoo(package_name, sha256, outdir, api_key):
+    if not api_key:
+        return False
+    if not sha256:
+        print(f"[{package_name}] No SHA256 available, cannot download from AndroZoo.")
+        return False
+
+    pkg_dir = Path(outdir) / package_name
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    final_apk_path = pkg_dir / f"{package_name}.apk"
     
+    # Download directly to the final destination with "-o" instead of renaming later.
+    # The "-f" flag ensures curl fails cleanly on HTTP errors (e.g. 404).
+    cmd = [
+        "curl", "-f", "-s", "-L", "-G",
+        "-d", f"apikey={api_key}",
+        "-d", f"sha256={sha256}",
+        "-o", str(final_apk_path),
+        "https://androzoo.uni.lu/api/download"
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=600)
+        if res.returncode == 0 and final_apk_path.exists() and final_apk_path.stat().st_size > 0:
+            return True
+        else:
+            if final_apk_path.exists():
+                final_apk_path.unlink()
+            return False
+    except subprocess.TimeoutExpired:
+        if final_apk_path.exists():
+            final_apk_path.unlink()
+        return False
+
+def load_apk_info(json_path):
+    import json
+    if not json_path or not Path(json_path).exists():
+        return {}
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return {item["packageName"]: item.get("sha256") for item in data}
+
 
 def main(argv=None):
     import sqlite3
@@ -374,6 +440,7 @@ def main(argv=None):
     p.add_argument("--outdir", help="download output directory (not needed with --check)")
     p.add_argument("--check", action="store_true",
                    help="probe every account's login and report valid/invalid, then exit")
+    p.add_argument("--json_parser_path", help="path to apk info json file generated by metadata_paser tool")
     p.add_argument("--db", default="queue.db", help="SQLite queue file")
     p.add_argument("--logdir", default="logs", help="per-account apkeep logs")
     p.add_argument("--apkeep", default="apkeep", help="path to apkeep binary")
@@ -423,6 +490,20 @@ def main(argv=None):
         cfg.options.append("include_additional_files=1")
     if cfg.dex_metadata:
         cfg.options.append("include_dex_metadata=1")
+
+    # Load environment variables from .env if present
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # If python-dotenv is not installed, fallback to standard environment variables
+
+    cfg.androzoo_api_key = os.environ.get("ANDROZOO_API_KEY")
+
+    if cfg.json_parser_path:
+        cfg.apk_info = load_apk_info(cfg.json_parser_path)
+    else:
+        cfg.apk_info = {}
 
     pkgs = read_pkgs(cfg.apps, cfg.field)
     if not pkgs:
