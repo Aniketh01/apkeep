@@ -326,7 +326,11 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
                             else:
                                 final_failures.append(pkg)
                     else:
-                        # Silently skip AndroZoo if no API key or no SHA256 mapping
+                        if not cfg.androzoo_api_key:
+                            print(f"[{name}] No AndroZoo API key found, skipping AndroZoo download for {pkg}.")
+                        elif not sha256:
+                            print(f"[{name}] No SHA256 found for {pkg}, skipping AndroZoo download.")
+                        
                         if exists is False:
                             not_found.append(pkg)
                         else:
@@ -374,7 +378,7 @@ def _worker_loop(name, account, conn, lock, cfg, stop, cooldowns_used):
 def read_accounts(path):
     base = Path(path).resolve().parent  # device paths are relative to accounts.csv
     accounts = []
-    with open(path, newline="") as f:
+    with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             if not row.get("email", "").strip() or row["email"].lstrip().startswith("#"):
                 continue
@@ -435,24 +439,47 @@ def download_package_from_Androzoo(package_name, sha256, outdir, api_key, versio
     pkg_dir.mkdir(parents=True, exist_ok=True)
     final_apk_path = pkg_dir / f"{package_name}.apk"
     
-    # Download directly to the final destination with "-o" instead of renaming later.
-    # The "-f" flag ensures curl fails cleanly on HTTP errors (e.g. 404).
+    # Download using the recommended Androzoo command
     cmd = [
-        "curl", "-f", "-s", "-L", "-G",
+        "curl", "-sS", "-L", "-O", "--remote-header-name", "-G",
         "-d", f"apikey={api_key}",
         "-d", f"sha256={sha256}",
-        "-o", str(final_apk_path),
         "https://androzoo.uni.lu/api/download"
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, timeout=600)
-        if res.returncode == 0 and final_apk_path.exists() and final_apk_path.stat().st_size > 0:
-            return True
-        else:
-            if final_apk_path.exists():
-                final_apk_path.unlink()
-            return False
+        # We run curl in pkg_dir so -O saves the file there
+        res = subprocess.run(cmd, capture_output=True, timeout=600, cwd=str(pkg_dir))
+        
+        if res.returncode == 0:
+            # AndroZoo saves it as <sha256>.apk. Rename it to final_apk_path.
+            expected_apk = pkg_dir / f"{sha256.upper()}.apk"
+            alt_expected_apk = pkg_dir / f"{sha256.lower()}.apk"
+            
+            downloaded_apk = None
+            if expected_apk.exists():
+                downloaded_apk = expected_apk
+            elif alt_expected_apk.exists():
+                downloaded_apk = alt_expected_apk
+            else:
+                for f in pkg_dir.glob("*.apk"):
+                    if f.name != final_apk_path.name:
+                        downloaded_apk = f
+                        break
+            
+            if downloaded_apk and downloaded_apk.exists():
+                downloaded_apk.rename(final_apk_path)
+
+            if final_apk_path.exists() and final_apk_path.stat().st_size > 0:
+                return True
+                
+        print(f"[{package_name}] AndroZoo download failed. rc={res.returncode}")
+        if res.stderr:
+            print(f"[{package_name}] AndroZoo curl stderr: {res.stderr.decode('utf-8', errors='ignore').strip()}")
+        if final_apk_path.exists():
+            final_apk_path.unlink()
+        return False
     except subprocess.TimeoutExpired:
+        print(f"[{package_name}] AndroZoo download timed out.")
         if final_apk_path.exists():
             final_apk_path.unlink()
         return False
@@ -529,9 +556,17 @@ def main(argv=None):
     # Load environment variables from .env if present
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        env_path = Path(__file__).resolve().parent / ".env"
+        load_dotenv(dotenv_path=env_path)
     except ImportError:
-        pass  # If python-dotenv is not installed, fallback to standard environment variables
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.is_file():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        os.environ.setdefault(k.strip(), v.strip().strip('"\''))
 
     cfg.androzoo_api_key = os.environ.get("ANDROZOO_API_KEY")
 
